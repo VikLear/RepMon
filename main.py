@@ -1,80 +1,86 @@
 import argparse
 import logging
 
+import pipeline
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(__name__)
 
 
-def run_banki(max_reviews: int, bank: str, delay: float):
-    from collector.banki_parser import collect
-    logger.info("=== Banki.ru collector ===")
-    saved = collect(bank=bank, max_reviews=max_reviews, page_delay=delay)
-    logger.info(f"Banki.ru: saved {saved} reviews")
-
-
-def run_otzovik(max_reviews: int, url: str, delay: float, debug: bool):
-    from collector.otzovik_parser import collect
-    logger.info("=== Otzovik.com collector ===")
-    saved = collect(start_url=url, max_reviews=max_reviews, page_delay=delay, debug=debug)
-    logger.info(f"Otzovik: saved {saved} reviews")
-
-
-def run_vk(max_reviews: int, delay: float, queries: list[str] | None):
-    from collector.vk_parser import collect
-    logger.info("=== VK collector ===")
-    saved = collect(queries=queries, max_reviews=max_reviews, request_delay=delay)
-    logger.info(f"VK: saved {saved} posts")
-
-
-def run_nlp(batch_size: int, source_filter: str | None):
-    from nlp.sentiment import classify_db_reviews
-    logger.info("=== NLP sentiment classifier ===")
-    classified = classify_db_reviews(batch_size=batch_size, source_filter=source_filter)
-    logger.info(f"NLP: classified {classified} reviews")
-
-
-def run_topics(source_filter: str | None):
-    from nlp.topics import classify_db_topics
-    logger.info("=== Topic classifier ===")
-    tagged = classify_db_topics(source_filter=source_filter)
-    logger.info(f"Topics: tagged {tagged} reviews")
-
-
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="Reputation monitor — data collector & NLP")
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Reputation monitor")
 
     ap.add_argument(
-        "--source",
-        choices=["banki", "otzovik", "vk", "nlp", "topics", "all"],
+        "--stage",
+        choices=["collect", "classify", "score", "all", "stats", "evaluate"],
         default="all",
-        help="Which step to run (default: all)",
+        help="Pipeline stage to run (default: all)",
     )
-    ap.add_argument("--max", type=int, default=500, help="Max reviews per source (default: 500)")
-    ap.add_argument("--delay", type=float, default=2.0, help="Delay between requests (default: 2.0)")
-    ap.add_argument("--bank", default="tcs", help="Bank slug for Banki.ru (default: tcs)")
-    ap.add_argument(
-        "--otzovik-url",
-        default="https://otzovik.com/reviews/t-bank/?order=date_desc",
-        help="Start URL for Otzovik",
-    )
-    ap.add_argument("--vk-queries", nargs="+", default=None, help="Search queries for VK")
-    ap.add_argument("--debug", action="store_true", help="Save debug HTML (Otzovik only)")
-    ap.add_argument("--nlp-batch", type=int, default=32, help="NLP batch size (default: 32)")
-    ap.add_argument("--nlp-source", default=None, help="Filter NLP by source (banki_ru / vk / telegram)")
+
+    # collect
+    ap.add_argument("--sources", nargs="+", default=None,
+                    choices=["banki", "otzovik"],
+                    help="Data sources (default: all)")
+    ap.add_argument("--max", type=int, default=500, help="Max reviews per source")
+    ap.add_argument("--bank", default="tcs", help="Banki.ru bank slug")
+    ap.add_argument("--banki-delay", type=float, default=1.0)
+    ap.add_argument("--otzovik-url",
+                    default="https://otzovik.com/reviews/t-bank/?order=date_desc")
+    ap.add_argument("--otzovik-delay", type=float, default=3.0)
+    ap.add_argument("--otzovik-headless", action="store_true")
+    ap.add_argument("--otzovik-debug", action="store_true")
+
+    # classify
+    ap.add_argument("--nlp-batch", type=int, default=32)
+    ap.add_argument("--nlp-source", default=None,
+                    help="Classify only reviews from this source")
+
+    # score
+    ap.add_argument("--score-days", type=int, default=30,
+                    help="Days of history to backfill")
+
+    # evaluate
+    ap.add_argument("--eval-n", type=int, default=100,
+                    help="Number of samples for manual evaluation")
 
     args = ap.parse_args()
 
-    if args.source in ("banki", "all"):
-        run_banki(max_reviews=args.max, bank=args.bank, delay=args.delay)
+    from database import init_db
+    init_db()
 
-    if args.source in ("otzovik", "all"):
-        run_otzovik(max_reviews=args.max, url=args.otzovik_url, delay=args.delay, debug=args.debug)
+    collect_kwargs = dict(
+        banki_bank=args.bank,
+        banki_delay=args.banki_delay,
+        otzovik_url=args.otzovik_url,
+        otzovik_delay=args.otzovik_delay,
+        otzovik_headless=args.otzovik_headless,
+        otzovik_debug=args.otzovik_debug,
+    )
 
-    if args.source in ("vk", "all"):
-        run_vk(max_reviews=args.max, delay=args.delay, queries=args.vk_queries)
+    if args.stage == "collect":
+        pipeline.collect(sources=args.sources, max_reviews=args.max, **collect_kwargs)
 
-    if args.source in ("nlp", "all"):
-        run_nlp(batch_size=args.nlp_batch, source_filter=args.nlp_source)
+    elif args.stage == "classify":
+        pipeline.classify(batch_size=args.nlp_batch, source_filter=args.nlp_source)
 
-    if args.source in ("topics", "all"):
-        run_topics(source_filter=args.nlp_source)
+    elif args.stage == "score":
+        pipeline.score(days=args.score_days)
+
+    elif args.stage == "stats":
+        pipeline.stats()
+
+    elif args.stage == "evaluate":
+        pipeline.evaluate(n=args.eval_n)
+
+    else:  # all
+        result = pipeline.run_all(
+            sources=args.sources,
+            max_reviews=args.max,
+            nlp_batch=args.nlp_batch,
+            score_days=args.score_days,
+            **collect_kwargs,
+        )
+        print(f"\nReputation score: {result['score']:.1f} / 100")
+
+
+if __name__ == "__main__":
+    main()

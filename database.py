@@ -1,4 +1,5 @@
 import os
+from contextlib import contextmanager
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 from datetime import datetime
@@ -45,7 +46,18 @@ def init_db():
     Base.metadata.create_all(bind=engine)
 
 
+@contextmanager
+def db_session():
+    """Context manager for regular (non-FastAPI) use."""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
 def get_db():
+    """FastAPI dependency."""
     db = SessionLocal()
     try:
         yield db
