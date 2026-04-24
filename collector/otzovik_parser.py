@@ -5,9 +5,11 @@ import re
 from datetime import datetime
 
 from bs4 import BeautifulSoup
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from collector.base import BaseCollector, save_review
+from database import Review
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +19,25 @@ MONTH_MAP = {
     "янв": 1, "фев": 2, "мар": 3, "апр": 4, "май": 5, "июн": 6,
     "июл": 7, "авг": 8, "сен": 9, "окт": 10, "ноя": 11, "дек": 12,
 }
+
+# Matches "28 янв 2026", "28 января 2026" etc.
+_RU_DATE_RE = re.compile(
+    r"\d{1,2}\s+(?:янв|фев|мар|апр|май|июн|июл|авг|сен|окт|ноя|дек)\w*\s+\d{4}",
+    re.IGNORECASE,
+)
+
+
+def _clean_text(text: str) -> str:
+    """Strip Otzovik author metadata header: 'Ник Репутация N Страна R DD Mon YYYY ...'"""
+    if "Репутация" not in text[:150]:
+        return text
+    m = _RU_DATE_RE.search(text)
+    if m:
+        return text[m.end():].strip()
+    # Date not found but Репутация present — strip up to the reputation block
+    idx = text.index("Репутация")
+    cut = text[idx:].split(None, 2)  # ['Репутация', 'N', 'остаток']
+    return cut[2].strip() if len(cut) >= 3 else text
 
 
 def _parse_ru_date(raw: str) -> datetime:
@@ -36,6 +57,7 @@ def _parse_ru_date(raw: str) -> datetime:
 def _build_driver(headless: bool = False):
     import undetected_chromedriver as uc
     options = uc.ChromeOptions()
+    options.page_load_strategy = "eager"  # ждём только DOM, не все ресурсы
     if headless:
         options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
@@ -44,7 +66,9 @@ def _build_driver(headless: bool = False):
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--lang=ru-RU,ru")
     driver = uc.Chrome(options=options, version_main=147)
-    driver.set_page_load_timeout(30)
+    driver.set_page_load_timeout(90)
+    driver.set_script_timeout(30)
+    driver.implicitly_wait(10)
     return driver
 
 
@@ -72,20 +96,24 @@ def _wait_for_reviews(driver, timeout: int = 20) -> bool:
         return False
 
 
-def _get_page_source(driver, url: str) -> str | None:
-    try:
-        driver.get(url)
-        time.sleep(random.uniform(2.0, 3.0))
-        if "captcha" in driver.page_source.lower():
-            logger.warning("Captcha detected — solve it manually (30s window)")
-            time.sleep(30)
-        _wait_for_reviews(driver)
-        _human_scroll(driver)
-        time.sleep(random.uniform(1.0, 2.0))
-        return driver.page_source
-    except Exception as e:
-        logger.error(f"Selenium failed on {url}: {e}")
-        return None
+def _get_page_source(driver, url: str, retries: int = 3) -> str | None:
+    for attempt in range(1, retries + 1):
+        try:
+            driver.get(url)
+            time.sleep(random.uniform(3.0, 5.0))
+            if "captcha" in driver.page_source.lower():
+                logger.warning("Captcha detected — solve it manually (30s window)")
+                time.sleep(30)
+            if _wait_for_reviews(driver, timeout=30):
+                _human_scroll(driver)
+                time.sleep(random.uniform(1.5, 2.5))
+                return driver.page_source
+            logger.warning(f"Attempt {attempt}/{retries}: reviews not found on {url}")
+        except Exception as e:
+            logger.warning(f"Attempt {attempt}/{retries} failed on {url}: {e}")
+            time.sleep(5 * attempt)
+    logger.error(f"All {retries} attempts failed for {url}")
+    return None
 
 
 def _parse_reviews(html: str) -> list[dict]:
@@ -98,7 +126,7 @@ def _parse_reviews(html: str) -> list[dict]:
     results = []
     for item in items:
         body_el = item.select_one("[itemprop='reviewBody']")
-        text = body_el.get_text(" ", strip=True) if body_el else item.get_text(" ", strip=True)
+        text = _clean_text(body_el.get_text(" ", strip=True) if body_el else item.get_text(" ", strip=True))
         if len(text) < 20:
             continue
 
@@ -142,7 +170,6 @@ def _get_next_url(html: str, current_url: str) -> str | None:
 
 class OtzovikCollector(BaseCollector):
     source = "otzovik"
-
     def __init__(
         self,
         start_url: str = "https://otzovik.com/reviews/t-bank/?order=date_desc",
@@ -158,9 +185,10 @@ class OtzovikCollector(BaseCollector):
     def collect(self, db: Session, max_reviews: int = 500) -> int:
         driver = _build_driver(headless=self.headless)
         saved = 0
+        cutoff = db.query(func.min(Review.date)).filter(Review.source == self.source).scalar()
         url = self.start_url
         debug = self.debug
-        logger.info(f"Otzovik: max={max_reviews}, url={url}")
+        logger.info(f"Otzovik: max={max_reviews}, cutoff={cutoff}, url={url}")
 
         try:
             while saved < max_reviews and url:
@@ -179,15 +207,23 @@ class OtzovikCollector(BaseCollector):
                     logger.warning(f"No reviews on {url} — stopping.")
                     break
 
+                all_old = True
                 new_on_page = 0
                 for r in reviews:
-                    if save_review(db, r):
-                        saved += 1
-                        new_on_page += 1
+                    if cutoff is None or r["date"] > cutoff:
+                        all_old = False
+                        if save_review(db, r):
+                            saved += 1
+                            new_on_page += 1
                     if saved >= max_reviews:
                         break
 
                 logger.info(f"Page {url}: +{new_on_page} new, {saved} total")
+
+                if all_old and cutoff:
+                    logger.info(f"All reviews on page predate DB cutoff ({cutoff.date()}) — stopping")
+                    break
+
                 url = _get_next_url(html, url)
                 time.sleep(self.page_delay * random.uniform(0.7, 1.4))
 

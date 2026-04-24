@@ -4,9 +4,11 @@ import time
 from datetime import datetime, timezone
 
 import requests
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from collector.base import BaseCollector, save_review
+from database import Review
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +68,8 @@ class BankiCollector(BaseCollector):
     def collect(self, db: Session, max_reviews: int = 500) -> int:
         saved = 0
         page = 1
-        logger.info(f"Banki.ru: bank={self.bank}, max={max_reviews}")
+        cutoff = db.query(func.min(Review.date)).filter(Review.source == self.source).scalar()
+        logger.info(f"Banki.ru: bank={self.bank}, max={max_reviews}, cutoff={cutoff}")
 
         while saved < max_reviews:
             try:
@@ -78,9 +81,23 @@ class BankiCollector(BaseCollector):
             if not items:
                 break
 
-            new_on_page = sum(save_review(db, r) for raw in items if (r := _extract(raw)))
-            saved += new_on_page
+            all_old = True
+            new_on_page = 0
+            for raw in items:
+                r = _extract(raw)
+                if not r:
+                    continue
+                if cutoff is None or r["date"] > cutoff:
+                    all_old = False
+                    if save_review(db, r):
+                        saved += 1
+                        new_on_page += 1
+
             logger.info(f"Page {page}: +{new_on_page} new, {saved} total")
+
+            if all_old and cutoff:
+                logger.info(f"All reviews on page {page} predate DB cutoff ({cutoff.date()}) — stopping")
+                break
 
             if not has_more or saved >= max_reviews:
                 break

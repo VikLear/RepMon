@@ -4,7 +4,7 @@ from typing import Optional
 
 from database import Review, db_session
 from nlp.sentiment import predict_batch
-from nlp.topics import classify_text
+from nlp.topics import classify_batch
 
 logger = logging.getLogger(__name__)
 
@@ -27,11 +27,12 @@ def run(batch_size: int = 32, source_filter: Optional[str] = None) -> int:
             texts = [r.text for r in batch]
 
             preds = predict_batch(texts, batch_size=batch_size)
+            topics = classify_batch(texts, batch_size=batch_size)
 
-            for review, pred in zip(batch, preds):
+            for review, pred, topic in zip(batch, preds, topics):
                 review.sentiment = pred["label"]
                 review.sentiment_score = pred["score"]
-                review.topic = classify_text(review.text)
+                review.topic = topic
 
             db.commit()
             logger.info(f"  {i + len(batch)}/{total} processed")
