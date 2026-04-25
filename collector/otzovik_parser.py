@@ -185,7 +185,7 @@ class OtzovikCollector(BaseCollector):
     def collect(self, db: Session, max_reviews: int = 500) -> int:
         driver = _build_driver(headless=self.headless)
         saved = 0
-        cutoff = db.query(func.min(Review.date)).filter(Review.source == self.source).scalar()
+        cutoff = db.query(func.max(Review.date)).filter(Review.source == self.source).scalar()
         url = self.start_url
         debug = self.debug
         logger.info(f"Otzovik: max={max_reviews}, cutoff={cutoff}, url={url}")

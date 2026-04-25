@@ -25,7 +25,8 @@ class Review(Base):
     date = Column(DateTime, nullable=False, index=True)
     sentiment = Column(String(20), nullable=True, index=True)  # positive / neutral / negative
     sentiment_score = Column(Float, nullable=True)
-    topic = Column(String(50), nullable=True, index=True)
+    topic = Column(String(50), nullable=True, index=True)   # primary topic (первая из списка)
+    topics = Column(Text, nullable=True)                     # JSON-список тем, напр. '["карты","переводы"]'
     created_at = Column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (
@@ -51,6 +52,7 @@ _MIGRATIONS = [
     "CREATE INDEX IF NOT EXISTS ix_reviews_sentiment   ON reviews (sentiment)",
     "CREATE INDEX IF NOT EXISTS ix_reviews_topic       ON reviews (topic)",
     "CREATE INDEX IF NOT EXISTS ix_reviews_date_source ON reviews (date, source)",
+    "ALTER TABLE reviews ADD COLUMN topics TEXT",
 ]
 
 
@@ -59,7 +61,10 @@ def init_db():
     Base.metadata.create_all(bind=engine)
     with engine.connect() as conn:
         for stmt in _MIGRATIONS:
-            conn.execute(text(stmt))
+            try:
+                conn.execute(text(stmt))
+            except Exception:
+                pass  # index/column already exists
         conn.commit()
 
 

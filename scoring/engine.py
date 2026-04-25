@@ -1,4 +1,6 @@
+import json
 import logging
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -126,3 +128,27 @@ def current_score() -> float:
     with db_session() as db:
         reviews = db.query(Review).filter(Review.sentiment.isnot(None)).all()
     return compute_score(reviews)
+
+
+def topic_breakdown(days: int = 30, source: Optional[str] = None) -> dict[str, int]:
+    """
+    Подсчёт упоминаний по темам за последние N дней.
+    Один отзыв может попасть в несколько тем (мультитопик).
+    """
+    since = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)
+    counts: Counter = Counter()
+
+    with db_session() as db:
+        query = db.query(Review.topics).filter(
+            Review.date >= since,
+            Review.topics.isnot(None),
+        )
+        if source:
+            query = query.filter(Review.source == source)
+        rows = query.all()
+
+    for (topics_json,) in rows:
+        for t in json.loads(topics_json):
+            counts[t] += 1
+
+    return dict(counts.most_common())

@@ -1,10 +1,11 @@
+import json
 import logging
 import random
 from typing import Optional
 
 from database import Review, db_session
 from nlp.sentiment import predict_batch
-from nlp.topics import classify_batch
+from nlp.topics import classify_batch_multi
 
 logger = logging.getLogger(__name__)
 
@@ -13,7 +14,7 @@ def run(batch_size: int = 32, source_filter: Optional[str] = None) -> int:
     """Single DB pass: assigns sentiment + topic to all unprocessed reviews."""
     with db_session() as db:
         query = db.query(Review).filter(
-            Review.sentiment.is_(None) | Review.topic.is_(None)
+            Review.sentiment.is_(None) | Review.topics.is_(None)
         )
         if source_filter:
             query = query.filter(Review.source == source_filter)
@@ -27,12 +28,13 @@ def run(batch_size: int = 32, source_filter: Optional[str] = None) -> int:
             texts = [r.text for r in batch]
 
             preds = predict_batch(texts, batch_size=batch_size)
-            topics = classify_batch(texts, batch_size=batch_size)
+            multi_topics = classify_batch_multi(texts, batch_size=batch_size)
 
-            for review, pred, topic in zip(batch, preds, topics):
+            for review, pred, topic_list in zip(batch, preds, multi_topics):
                 review.sentiment = pred["label"]
                 review.sentiment_score = pred["score"]
-                review.topic = topic
+                review.topic = topic_list[0]
+                review.topics = json.dumps(topic_list, ensure_ascii=False)
 
             db.commit()
             logger.info(f"  {i + len(batch)}/{total} processed")
@@ -52,16 +54,20 @@ def stats() -> dict:
             .group_by(Review.sentiment)
             .all()
         )
-        topic_rows = (
-            db.query(Review.topic, func.count(Review.id))
-            .filter(Review.topic.isnot(None))
-            .group_by(Review.topic)
+        topics_rows = (
+            db.query(Review.topics)
+            .filter(Review.topics.isnot(None))
             .all()
         )
 
+    topic_counts: dict[str, int] = {}
+    for (topics_json,) in topics_rows:
+        for t in json.loads(topics_json):
+            topic_counts[t] = topic_counts.get(t, 0) + 1
+
     return {
         "sentiment": {s: c for s, c in sentiment_rows},
-        "topics":    {t: c for t, c in topic_rows},
+        "topics":    topic_counts,
     }
 
 

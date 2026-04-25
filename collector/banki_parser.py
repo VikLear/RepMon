@@ -30,11 +30,27 @@ def _strip_html(html: str) -> str:
 
 
 def _parse_date(raw: str) -> datetime:
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+    if not raw:
+        logger.warning("_parse_date: empty dateCreate — falling back to now()")
+        return datetime.now(timezone.utc).replace(tzinfo=None)
+    s = raw.strip()
+    # fromisoformat handles "2026-04-24", "2026-04-24T15:23:50", "2026-04-24 15:23:50"
+    # and timezone-aware variants; strip trailing Z first
+    try:
+        dt = datetime.fromisoformat(s.rstrip("Z"))
+        return dt.replace(tzinfo=None)
+    except ValueError:
+        pass
+    for fmt in ("%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M", "%d.%m.%Y"):
         try:
-            return datetime.strptime(raw.strip()[:len(fmt)], fmt)
-        except (ValueError, TypeError):
+            return datetime.strptime(s, fmt)
+        except ValueError:
             continue
+    try:
+        return datetime.utcfromtimestamp(int(s))
+    except (ValueError, TypeError):
+        pass
+    logger.warning("_parse_date: unrecognised format %r — falling back to now()", s)
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
@@ -68,7 +84,7 @@ class BankiCollector(BaseCollector):
     def collect(self, db: Session, max_reviews: int = 500) -> int:
         saved = 0
         page = 1
-        cutoff = db.query(func.min(Review.date)).filter(Review.source == self.source).scalar()
+        cutoff = db.query(func.max(Review.date)).filter(Review.source == self.source).scalar()
         logger.info(f"Banki.ru: bank={self.bank}, max={max_reviews}, cutoff={cutoff}")
 
         while saved < max_reviews:
